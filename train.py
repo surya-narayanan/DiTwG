@@ -13,7 +13,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
@@ -26,6 +26,12 @@ from time import time
 import argparse
 import logging
 import os
+import pandas as pd
+from scipy.spatial.distance import euclidean
+from scipy.spatial import cKDTree
+import torch_geometric
+from torch_geometric.data import Data, DataLoader as PyGDataLoader
+from sklearn.model_selection import train_test_split
 
 from models import DiT_models
 from diffusion import create_diffusion
@@ -35,6 +41,144 @@ from diffusers.models import AutoencoderKL
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
+def compute_centroid(row):
+    """Compute the centroid of a bounding box."""
+    x_centroid = (row['xmin'] + row['xmax']) / 2
+    y_centroid = (row['ymin'] + row['ymax']) / 2
+    return np.array([x_centroid, y_centroid])
+
+def load_embedding(id):
+    """Load node embeddings."""
+    embedding_path = f'../../../../imagebind_embeddings/{id}.npy'
+    try:
+        return np.load(embedding_path)
+    except:
+        print(f'Missing embedding for {id}')
+        return np.zeros(1024)
+
+def compute_edges(df, k):
+    """Compute edges between nodes using k-nearest neighbors."""
+    df = df.reset_index(drop=True)
+    centroids = np.stack(df['centroid'].values)
+    n_nodes = centroids.shape[0]
+
+    if n_nodes <= 1:
+        return []
+
+    if n_nodes <= k:
+        k = n_nodes - 1
+
+    tree = cKDTree(centroids)
+    distances, indices = tree.query(centroids, k=k+1)
+
+    edges = []
+    for i in range(n_nodes):
+        neighbors = indices[i][1:]
+        for j in neighbors:
+            edges.append((i, j))
+    return edges
+
+def create_graph_data(df, threshold=150, k_neighbors=3, feature=None, dynamic_masking=False, mask_ratio=0.1, seed=None):
+    """Create graph data for an image."""
+    image_df = df
+    edges = compute_edges(image_df, k_neighbors)
+    
+    if len(edges) == 0:
+        return []
+    
+    # Create node features
+    node_features = np.stack(df['node_features'].values)
+    
+    # Create positional encodings from centroids
+    centroids = np.stack(df['centroid'].values)
+    normalized_centroids = (centroids - centroids.min(axis=0)) / (centroids.max(axis=0) - centroids.min(axis=0) + 1e-8)
+    
+    # Create sinusoidal positional encodings
+    pos_dim = 16
+    pos_encodings = np.zeros((centroids.shape[0], pos_dim))
+    
+    for i in range(0, pos_dim, 4):
+        pos_encodings[:, i:i+2] = np.sin(normalized_centroids * (2.0 ** (i//2)))
+        pos_encodings[:, i+2:i+4] = np.cos(normalized_centroids * (2.0 ** (i//2)))
+    
+    # Concatenate normalized centroids with positional encodings
+    pos_encodings = np.concatenate([pos_encodings, normalized_centroids], axis=1)
+    
+    # Concatenate node features with positional encodings
+    if feature == 'image':
+        node_features = np.concatenate([node_features, pos_encodings], axis=1)
+    
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    
+    # Create graph data object
+    data = Data(
+        x=torch.tensor(node_features, dtype=torch.float),
+        edge_index=edge_index,
+        orig_image=df['orig_image'].iloc[0]
+    )
+    
+    return data
+
+class GraphImageDataset(Dataset):
+    """Custom dataset that combines image and graph data."""
+    def __init__(self, image_dir, graph_data_dir, transform=None, feature='image', k_neighbors=3):
+        self.image_dir = image_dir
+        self.graph_data_dir = graph_data_dir
+        self.transform = transform
+        self.feature = feature
+        self.k_neighbors = k_neighbors
+        
+        # Load graph data
+        self.df = pd.read_csv(os.path.join(graph_data_dir, 'image_components_database.csv'))
+        self.df = self.df[(~self.df['short_labels'].isna()) & ~(self.df['xmin'].isna())]
+        
+        # Compute centroids
+        self.df['centroid'] = self.df.apply(compute_centroid, axis=1)
+        
+        # Load node features
+        self.df['node_features'] = self.df['id'].apply(load_embedding)
+        
+        # Group by image
+        self.image_groups = list(self.df.groupby('orig_image'))
+        
+    def __len__(self):
+        return len(self.image_groups)
+    
+    def __getitem__(self, idx):
+        image_name, image_df = self.image_groups[idx]
+        
+        # Load and transform image
+        image_path = os.path.join(self.image_dir, image_name)
+        image = Image.open(image_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        
+        # Create graph data
+        graph_data = create_graph_data(
+            image_df,
+            feature=self.feature,
+            k_neighbors=self.k_neighbors
+        )
+        
+        return image, graph_data
+
+def custom_collate(batch):
+    """Custom collate function to handle both images and graph data."""
+    images = []
+    graph_data_list = []
+    
+    for image, graph_data in batch:
+        images.append(image)
+        graph_data_list.append(graph_data)
+    
+    # Stack images
+    images = torch.stack(images)
+    
+    # Use PyG's batch function for graph data
+    graph_batch = torch_geometric.data.Batch.from_data_list(graph_data_list)
+    
+    return images, graph_batch
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -109,7 +253,7 @@ def center_crop_arr(pil_image, image_size):
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new DiT model with graph conditioning.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -141,7 +285,8 @@ def main(args):
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        use_graph_embedding=True,  # Enable graph embedding
+        graph_input_dim=1042,     # Set input dimension for graph features
     )
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -161,7 +306,16 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    
+    # Create custom dataset
+    dataset = GraphImageDataset(
+        args.data_path,
+        args.graph_data_dir,
+        transform=transform,
+        feature='image',
+        k_neighbors=args.k_neighbors
+    )
+    
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -169,6 +323,7 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
+    
     loader = DataLoader(
         dataset,
         batch_size=int(args.global_batch_size // dist.get_world_size()),
@@ -176,9 +331,10 @@ def main(args):
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=custom_collate
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    logger.info(f"Dataset contains {len(dataset):,} images with graphs ({args.data_path})")
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -195,16 +351,26 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for x, graph_data in loader:
             x = x.to(device)
-            y = y.to(device)
+            graph_data = graph_data.to(device)
+            
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            model_kwargs = dict(y=y)
+            
+            # Prepare model kwargs with graph data
+            model_kwargs = dict(
+                y=graph_data.x,  # Use graph node features
+                edge_index=graph_data.edge_index,
+                batch=graph_data.batch
+            )
+            
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
+            
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -254,10 +420,10 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--graph-data-dir", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
@@ -265,5 +431,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--k-neighbors", type=int, default=3)
     args = parser.parse_args()
     main(args)

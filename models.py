@@ -14,6 +14,8 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import torch_geometric
+import torch.nn.functional as F
 
 
 def modulate(x, shift, scale):
@@ -94,6 +96,106 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+class GraphEmbedder(nn.Module):
+    """
+    Embeds graph structures into vector representations using a GNN architecture.
+    """
+    def __init__(self, input_dim, hidden_size, num_layers=5, num_heads=16, dropout_rate=0.3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # GNN layers
+        self.layers = nn.ModuleList()
+        
+        # First layer
+        self.layers.append(torch_geometric.nn.GATv2Conv(
+            in_channels=input_dim,
+            out_channels=hidden_size//num_heads,
+            heads=num_heads,
+            dropout=dropout_rate
+        ))
+        
+        # Intermediate layers
+        for _ in range(num_layers - 1):
+            self.layers.append(torch_geometric.nn.GATv2Conv(
+                in_channels=hidden_size,
+                out_channels=hidden_size//num_heads,
+                heads=num_heads,
+                dropout=dropout_rate
+            ))
+        
+        # Batch normalization layers
+        self.batch_norms = nn.ModuleList([
+            torch_geometric.nn.BatchNorm(hidden_size) for _ in range(num_layers)
+        ])
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # Final projection layer
+        self.final_proj = nn.Linear(hidden_size, hidden_size)
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize the weights of the network."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch_geometric.nn.GATv2Conv):
+                nn.init.xavier_uniform_(m.lin_src.weight)
+                nn.init.xavier_uniform_(m.lin_dst.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, edge_index, batch=None):
+        """
+        Forward pass of the graph embedder.
+        
+        Args:
+            x: Node features (N, input_dim)
+            edge_index: Edge indices (2, E)
+            batch: Batch assignment vector (N,)
+            
+        Returns:
+            Graph embedding (B, hidden_size) where B is the number of graphs in the batch
+        """
+        # Apply GNN layers
+        for i, layer in enumerate(self.layers):
+            # Apply layer
+            x = layer(x, edge_index)
+            
+            # Apply batch normalization
+            x = self.batch_norms[i](x)
+            
+            # Apply ELU activation
+            x = F.elu(x)
+            
+            # Apply dropout
+            x = self.dropout(x)
+            
+            # Apply layer normalization every other layer
+            if i % 2 == 0:
+                x = self.layer_norm(x)
+        
+        # Global mean pooling to get graph-level embeddings
+        if batch is not None:
+            x = torch_geometric.nn.global_mean_pool(x, batch)
+        else:
+            x = x.mean(dim=0)  # If no batch, treat as single graph
+        
+        # Final projection
+        x = self.final_proj(x)
+        
+        return x
+
+
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
@@ -158,6 +260,8 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        use_graph_embedding=True,  # New parameter to control embedding type
+        graph_input_dim=1042,     # New parameter for graph input dimension
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -165,10 +269,22 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.use_graph_embedding = use_graph_embedding
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        
+        # Choose between label and graph embedding
+        if use_graph_embedding:
+            self.y_embedder = GraphEmbedder(
+                input_dim=graph_input_dim,
+                hidden_size=hidden_size,
+                num_layers=5,
+                num_heads=num_heads
+            )
+        else:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+            
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -230,16 +346,26 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, edge_index=None, batch=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        y: (N,) tensor of class labels or graph features
+        edge_index: (2, E) tensor of edge indices (required if using graph embedding)
+        batch: (N,) tensor of batch assignments (required if using graph embedding)
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
+        
+        # Handle different embedding types
+        if self.use_graph_embedding:
+            if edge_index is None or batch is None:
+                raise ValueError("edge_index and batch are required when using graph embedding")
+            y = self.y_embedder(y, edge_index, batch)  # (N, D)
+        else:
+            y = self.y_embedder(y, self.training)    # (N, D)
+            
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
@@ -247,14 +373,14 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, edge_index=None, batch=None):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        model_out = self.forward(combined, t, y, edge_index, batch)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
